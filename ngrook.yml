@@ -1,0 +1,8 @@
+version: 3
+
+agent:
+  authtoken: 39Xpzr4cdaqQaVECrVSeiEdcnRk_53RpjrGECY7ZREdP1ytMn
+
+endpoints:
+  - name: http
+    url: http://localhost:8001

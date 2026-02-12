@@ -29,6 +29,9 @@ AGENT_MODEL = os.getenv("AGENT_MODEL", "")
 AGENT_TIMEOUT_SECONDS = int(os.getenv("AGENT_TIMEOUT_SECONDS", "120"))
 AGENT_CLICKUP_MCP_IDENTIFIER = os.getenv("AGENT_CLICKUP_MCP_IDENTIFIER", "clickup")
 AGENT_QUEUE_MAXSIZE = int(os.getenv("AGENT_QUEUE_MAXSIZE", "200"))
+TARGET_REPO_PATH = os.getenv("TARGET_REPO_PATH", "")
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 
@@ -140,6 +143,21 @@ def _is_in_progress_status(status: str) -> bool:
     return normalized in {"in progress", "progress"}
 
 
+def _is_review_status(status: str) -> bool:
+    normalized = _normalize_status(status)
+    return normalized in {"review", "in review", "awaiting review", "code review"}
+
+
+def _is_closed_status(status: str) -> bool:
+    normalized = _normalize_status(status)
+    return normalized in {"closed", "done", "complete", "completed"}
+
+
+def _is_blocked_status(status: str) -> bool:
+    normalized = _normalize_status(status)
+    return normalized in {"blocked"}
+
+
 def _is_open_status(status: str) -> bool:
     normalized = _normalize_status(status)
     return normalized == "open"
@@ -175,11 +193,19 @@ def is_task_open_or_in_progress(task: dict[str, Any]) -> bool:
 
 
 def is_eligible_task(task: dict[str, Any]) -> bool:
-    return (
-        has_agent_tag(task)
-        and is_task_assigned_to_me(task)
-        and is_task_open_or_in_progress(task)
+    tag_ok = has_agent_tag(task)
+    assignee_ok = is_task_assigned_to_me(task)
+    status_ok = is_task_open_or_in_progress(task)
+    task_id = task.get("id", "?")
+    tags = [str(t.get("name", "")) for t in (task.get("tags", []) or [])]
+    status = str((task.get("status", {}) or {}).get("status", ""))
+    assignees = [str(a.get("username", "")) for a in (task.get("assignees", []) or [])]
+    logger.debug(
+        "Eligibility check: task_id=%s tag_ok=%s (tags=%s) assignee_ok=%s (assignees=%s) "
+        "status_ok=%s (status=%s)",
+        task_id, tag_ok, tags, assignee_ok, assignees, status_ok, status,
     )
+    return tag_ok and assignee_ok and status_ok
 
 
 def is_status_transition_to_in_progress(payload: dict[str, Any]) -> bool:
@@ -296,15 +322,91 @@ async def move_task_to_in_progress(task: dict[str, Any]) -> tuple[bool, str]:
     return (True, f"moved_to_{target_status}")
 
 
+async def _find_status_in_list(
+    list_id: str, matcher: callable
+) -> str | None:
+    """Look up a status name from the list's configured statuses."""
+    list_url = f"https://api.clickup.com/api/v2/list/{list_id}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(list_url, headers=_clickup_headers())
+        resp.raise_for_status()
+    for s in resp.json().get("statuses", []):
+        if matcher(str(s.get("status", ""))):
+            return str(s["status"])
+    return None
+
+
+async def update_task_status(
+    task_id: str, list_id: str, matcher: callable, label: str
+) -> tuple[bool, str]:
+    """Move a task to the first status in its list that matches `matcher`."""
+    target = await _find_status_in_list(list_id, matcher)
+    if not target:
+        logger.warning(
+            "No '%s' status found in list %s for task %s",
+            label, list_id, task_id,
+        )
+        return (False, f"{label}_status_not_found")
+
+    url = f"https://api.clickup.com/api/v2/task/{task_id}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.put(url, headers=_clickup_headers(), json={"status": target})
+        resp.raise_for_status()
+
+    logger.info("Task %s moved to %s (%s)", task_id, target, label)
+    return (True, f"moved_to_{target}")
+
+
+# Maps agent outcome keywords → status matcher functions
+OUTCOME_STATUS_MAP: dict[str, callable] = {
+    "done": _is_closed_status,
+    "review": _is_review_status,
+    "blocked": _is_blocked_status,
+}
+
+VALID_OUTCOMES = {"done", "review", "blocked", "in_progress"}
+
+
+def _parse_agent_outcome(agent_output: str) -> str:
+    """Extract the OUTCOME: <value> line from agent output."""
+    import re
+
+    for line in reversed(agent_output.splitlines()):
+        match = re.match(r"^\s*OUTCOME:\s*(\w+)", line, re.IGNORECASE)
+        if match:
+            outcome = match.group(1).strip().lower()
+            if outcome in VALID_OUTCOMES:
+                return outcome
+    # Fallback: try to infer from keywords in the last few lines
+    tail = agent_output[-500:].lower()
+    if "pull request" in tail or "PR" in agent_output[-500:]:
+        return "review"
+    if "completed" in tail or "task is done" in tail:
+        return "done"
+    if "blocked" in tail or "cannot proceed" in tail:
+        return "blocked"
+    return "in_progress"
+
+
+def _extract_list_id(task_details_json: str) -> str | None:
+    """Pull the list ID from the task details JSON string."""
+    try:
+        data = json.loads(task_details_json)
+        return str(data.get("list", {}).get("id", "")) or None
+    except (json.JSONDecodeError, AttributeError):
+        return None
+
+
 async def run_agent_prompt(prompt: str) -> str:
     command = [
         AGENT_COMMAND,
         "--print",
         "--output-format",
         "text",
+        "--force",
         "--approve-mcps",
         "--workspace",
-        os.getcwd(),
+        TARGET_REPO_PATH or os.getcwd(),
     ]
     if AGENT_MODEL:
         command.extend(["--model", AGENT_MODEL])
@@ -315,10 +417,15 @@ async def run_agent_prompt(prompt: str) -> str:
         AGENT_TIMEOUT_SECONDS,
     )
 
+    agent_env = os.environ.copy()
+    agent_env["GITHUB_TOKEN"] = os.getenv("GITHUB_TOKEN", "")
+
     process = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=TARGET_REPO_PATH or None,
+        env=agent_env,
     )
 
     try:
@@ -391,14 +498,44 @@ async def process_task_queue_worker() -> None:
             task_queue.qsize(),
         )
         try:
+            repo_info = (
+                f"Target repository: {TARGET_REPO_PATH}\n"
+                f"GitHub: {GITHUB_OWNER}/{GITHUB_REPO}\n"
+                if TARGET_REPO_PATH else ""
+            )
             prompt = (
-                "You are processing a ClickUp task event from a webhook.\n"
+                "You are an autonomous coding agent. A ClickUp task has been assigned to you.\n"
+                "Your job is to READ the task description, IMPLEMENT the changes in code, "
+                "and CREATE a pull request on GitHub when done.\n\n"
+                f"{repo_info}"
                 f"Event: {event}\n"
-                f"Task ID: {task_id}\n"
-                "Task details (JSON or text) are below:\n"
+                f"Task ID: {task_id}\n\n"
+                "Here are the COMPLETE task details from the ClickUp API (JSON):\n"
                 f"{task_details}\n\n"
-                "Use the configured ClickUp MCP server to gather any missing context "
-                "for this task and return a concise action plan with the next best step."
+                "You already have all the task context above — do NOT try to fetch "
+                "the task again via MCP or any other tool.\n\n"
+                "INSTRUCTIONS — you MUST actually execute each step, not just list them:\n"
+                "1. Read the task name and description carefully to understand what is asked.\n"
+                f"2. Run: git checkout main && git pull origin main\n"
+                f"3. Run: git checkout -b task/{task_id}\n"
+                "4. Implement the required changes in the repository files.\n"
+                "5. Run: git add -A && git commit -m 'task/{task_id}: <summary of changes>'\n"
+                f"6. Run: git push -u origin task/{task_id}\n"
+                f"7. Create a Pull Request on GitHub using the GitHub MCP to {GITHUB_OWNER}/{GITHUB_REPO}.\n"
+                f"   - Base branch: main\n"
+                f"   - Head branch: task/{task_id}\n"
+                "   - PR title should reference the task name.\n"
+                "   - PR body should describe what was done.\n"
+                "8. If you created a PR, the outcome is 'review'.\n"
+                "   If the task doesn't require code changes and you completed it, outcome is 'done'.\n"
+                "   If you're blocked, outcome is 'blocked'.\n\n"
+                "You MUST run the git and push commands yourself using the terminal. Do NOT just list them.\n\n"
+                "IMPORTANT: At the very end of your response, you MUST include exactly "
+                "one of these outcome lines on its own line:\n"
+                "  OUTCOME: done        — if you fully completed the task (no PR needed)\n"
+                "  OUTCOME: review      — if you created a PR or the work needs review\n"
+                "  OUTCOME: blocked     — if you cannot proceed (missing info, access, etc.)\n"
+                "  OUTCOME: in_progress — if the task is partially done and needs more work\n"
             )
             agent_result = await run_agent_prompt(prompt)
             logger.info(
@@ -406,6 +543,29 @@ async def process_task_queue_worker() -> None:
                 task_id,
                 agent_result,
             )
+
+            # Parse outcome from agent response and update ClickUp status
+            outcome = _parse_agent_outcome(agent_result)
+            logger.info("Parsed agent outcome: task_id=%s outcome=%s", task_id, outcome)
+
+            if outcome in OUTCOME_STATUS_MAP:
+                list_id = _extract_list_id(task_details)
+                if list_id:
+                    ok, result = await update_task_status(
+                        task_id, list_id, OUTCOME_STATUS_MAP[outcome], outcome
+                    )
+                    logger.info(
+                        "Status update after agent: task_id=%s outcome=%s success=%s result=%s",
+                        task_id, outcome, ok, result,
+                    )
+                else:
+                    logger.warning(
+                        "Cannot update status — no list_id found: task_id=%s", task_id
+                    )
+            else:
+                logger.info(
+                    "No status change needed for outcome=%s task_id=%s", outcome, task_id
+                )
         except Exception as e:
             logger.exception(
                 "Cursor Agent failed while processing queued task task_id=%s error=%s",
@@ -494,7 +654,6 @@ async def clickup_webhook(payload: dict):
     if not task_id:
         return {"status": "ok"}
 
-    task_details_via_agent = ""
     task_details_from_api: dict[str, Any] = {}
     try:
         task_details_from_api = await get_clickup_task_details(str(task_id))
@@ -528,24 +687,12 @@ async def clickup_webhook(payload: dict):
             "task_id": task_id,
         }
 
-    try:
-        task_details_via_agent = await get_clickup_task_details_via_agent(task_id)
-        logger.info(
-            "Fetched task details via Cursor Agent MCP: task_id=%s details=%s",
-            task_id,
-            task_details_via_agent,
-        )
-    except Exception as e:
-        logger.exception(
-            "Failed to fetch task details via Cursor Agent MCP for task_id=%s error=%s",
-            task_id,
-            e,
-        )
-        task_details_via_agent = json.dumps(task_details_from_api)
+    # Use REST API task details directly — no need to call the agent just to fetch them
+    task_details_for_agent = json.dumps(task_details_from_api)
 
     move_status_ok = False
     move_status_result = "not_attempted"
-    if task_details_from_api and event == "taskCreated":
+    if task_details_from_api and is_task_open(task_details_from_api):
         try:
             move_status_ok, move_status_result = await move_task_to_in_progress(
                 task_details_from_api
@@ -563,18 +710,12 @@ async def clickup_webhook(payload: dict):
                 task_id,
                 e,
             )
-    elif event == "taskUpdated":
-        move_status_result = "skipped_for_task_updated_event"
-        logger.info(
-            "Skipping status transition because event is taskUpdated: task_id=%s",
-            task_id,
-        )
 
     try:
         await enqueue_task_for_agent(
             task_id=str(task_id),
             event=str(event),
-            task_details_for_agent=task_details_via_agent,
+            task_details_for_agent=task_details_for_agent,
         )
     except Exception as e:
         logger.exception(
@@ -587,7 +728,7 @@ async def clickup_webhook(payload: dict):
     await manager.broadcast({
         "type": "clickup_webhook",
         "payload": payload,
-        "task_details": task_details_via_agent,
+        "task_details": task_details_for_agent,
         "moved_to_in_progress": move_status_ok,
         "move_status_result": move_status_result,
         "enqueued": True,
